@@ -1,5 +1,10 @@
 # Changelog
 
+## v1.0.1
+
+- Hotfix: autosense Xbox-compatible controllers from Blender startup and auto-arm AirBlender without clicking the icon.
+- Fix floating icon label to read AirBlender.
+
 ## v1.0.0
 
 - Add no-terminal Blender startup runtime with floating controller icon.

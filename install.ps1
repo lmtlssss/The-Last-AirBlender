@@ -1,5 +1,5 @@
 $ErrorActionPreference = "Stop"
-$Repo = "lmtlssss/last-airblender"
+$Repo = "lmtlssss/The-Last-AirBlender"
 $Version = $env:LAST_AIRBLENDER_VERSION
 if (-not $Version) { $Base = "https://github.com/$Repo/releases/latest/download" } else { $Base = "https://github.com/$Repo/releases/download/$Version" }
 $Arch = if ([Environment]::Is64BitOperatingSystem) { "x86_64" } else { throw "Only 64-bit Windows is supported" }

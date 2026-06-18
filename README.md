@@ -11,13 +11,13 @@ The Last AirBlender gives Blender a fast cinematic camera-flight mode: pick up a
 ### Linux/macOS
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/lmtlssss/last-airblender/main/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/lmtlssss/The-Last-AirBlender/main/install.sh | sh
 ```
 
 Safer inspect-first path:
 
 ```bash
-curl -fsSLO https://raw.githubusercontent.com/lmtlssss/last-airblender/main/install.sh
+curl -fsSLO https://raw.githubusercontent.com/lmtlssss/The-Last-AirBlender/main/install.sh
 less install.sh
 sh install.sh
 ```
@@ -25,19 +25,19 @@ sh install.sh
 Pin a version:
 
 ```bash
-LAST_AIRBLENDER_VERSION=v1.0.0 sh install.sh
+LAST_AIRBLENDER_VERSION=v1.0.1 sh install.sh
 ```
 
 ### Windows PowerShell
 
 ```powershell
-irm https://raw.githubusercontent.com/lmtlssss/last-airblender/main/install.ps1 | iex
+irm https://raw.githubusercontent.com/lmtlssss/The-Last-AirBlender/main/install.ps1 | iex
 ```
 
 Inspect-first path:
 
 ```powershell
-irm https://raw.githubusercontent.com/lmtlssss/last-airblender/main/install.ps1 -OutFile install.ps1
+irm https://raw.githubusercontent.com/lmtlssss/The-Last-AirBlender/main/install.ps1 -OutFile install.ps1
 notepad install.ps1
 powershell -ExecutionPolicy Bypass -File .\install.ps1
 ```
@@ -56,9 +56,10 @@ Download the latest native installer from GitHub Releases:
 
 ### Normal no-terminal Blender runtime
 
-After install, open Blender normally. A small translucent controller icon appears in the 3D viewport.
+After install, open Blender normally. A small translucent controller icon labeled **AirBlender** appears in the 3D viewport. If an Xbox-compatible controller is visible to Blender, AirBlender autosenses it and arms camera flight automatically.
 
-- **Left-click the controller icon**: activate The Last AirBlender, create/attach the AirBlender camera rig, and switch to the split camera/third-person layout.
+- **Autosense**: plugging in an Xbox-compatible controller automatically activates The Last AirBlender, creates/attaches the camera rig, and switches to the split camera/third-person layout.
+- **Left-click the controller icon**: fallback manual activate if autosense has not armed yet.
 - **Right-click the controller icon**: show the native controls menu.
 - No terminal or background CLI is required for normal Blender use on systems where Blender can read the controller directly.
 
@@ -94,7 +95,7 @@ No remapping is required for normal use.
 
 ## Recording workflow
 
-1. Open Blender normally and click the floating controller icon.
+1. Open Blender normally with the controller plugged in; AirBlender autosenses it and arms itself.
 2. Use **Start/Menu double-tap** to create cameras, or **Start/Menu single tap** to cycle existing cameras.
 3. Fly until it feels right.
 4. Press **D-pad Down** to start recording.
@@ -135,7 +136,7 @@ Common issues:
 - **Blender not found**: set `BLENDER=/path/to/blender`.
 - **Controller not detected**: plug in an Xbox-compatible controller and rerun `doctor`.
 - **Linux permissions**: install package normally and ensure your user can access game controllers.
-- **Windows SmartScreen/macOS Gatekeeper**: v1.0.0 packages may be unsigned; use the inspect-first install path if preferred.
+- **Windows SmartScreen/macOS Gatekeeper**: v1.0.1 packages may be unsigned; use the inspect-first install path if preferred.
 
 ## Developer build
 

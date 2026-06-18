@@ -1,6 +1,6 @@
 #!/usr/bin/env sh
 set -eu
-REPO="lmtlssss/last-airblender"
+REPO="lmtlssss/The-Last-AirBlender"
 VERSION="${LAST_AIRBLENDER_VERSION:-latest}"
 TMP="$(mktemp -d)"
 cleanup(){ rm -rf "$TMP"; }

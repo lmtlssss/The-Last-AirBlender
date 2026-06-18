@@ -1,7 +1,7 @@
 bl_info = {
     "name": "The Last AirBlender",
     "author": "Codex",
-    "version": (1, 0, 0),
+    "version": (1, 0, 1),
     "blender": (4, 0, 0),
     "location": "View3D > Sidebar > The Last AirBlender",
     "description": "Fly Blender cameras with an Xbox-style controller and record cinematic camera takes.",
@@ -345,7 +345,11 @@ class DroneRuntime:
         self.pending_start_time = 0.0
         self.icon_draw_handler = None
         self.icon_running = False
-        self.icon_region = (22, 22, 42, 42)
+        self.icon_region = (22, 34, 112, 54)
+        self.auto_arm_running = False
+        self.auto_arm_last_try = 0.0
+        self.auto_arm_failures = 0
+
 
 
 
@@ -1878,18 +1882,98 @@ CONTROL_HELP_LINES = (
 )
 
 
+def controller_available_for_autoarm():
+    if os.name != "posix":
+        return False, "direct autosense needs Blender-visible controller backend"
+    devices = LinuxJoystickBackend.list_devices()
+    best = None
+    for path, name, axes, buttons in devices:
+        hay = (path + " " + name).lower()
+        if "keyd virtual" in hay or "pointer" in hay:
+            continue
+        if any(x in hay for x in ("x-box", "xbox", "microsoft", "controller", "pad", "gamepad")):
+            best = (path, name)
+            break
+    if best:
+        return True, "%s %s" % best
+    return False, "no Xbox-compatible controller visible to Blender"
+
+
+def ensure_scene_camera_for_autoarm(scene, context=None):
+    context = context or bpy.context
+    if scene.camera and scene.camera.type == "CAMERA":
+        scene.camera["lab_camera"] = True
+        return scene.camera
+    cams = sorted([o for o in bpy.data.objects if o.type == "CAMERA"], key=lambda o: o.name)
+    if cams:
+        scene.camera = cams[0]
+        scene.camera["lab_camera"] = True
+        return scene.camera
+    return create_airblender_camera(scene, context)
+
+
+def auto_arm_if_controller_present(context=None):
+    context = context or bpy.context
+    scene = getattr(context, "scene", None) or bpy.context.scene
+    if not scene or not hasattr(scene, "drone_flight_recorder_settings"):
+        return False
+    s = scene.drone_flight_recorder_settings
+    available, reason = controller_available_for_autoarm()
+    if not available:
+        s.controller_connected = False
+        s.status = "AirBlender waiting: " + reason
+        return False
+    ensure_scene_camera_for_autoarm(scene, context)
+    bpy.ops.dfr.create_rig()
+    configure_drone_split_view_layout(context)
+    ok = start_controller_flight(context)
+    if ok:
+        s.status = "AirBlender autosensed controller — Start cycles cameras, double-tap creates"
+    return ok
+
+
+def _auto_arm_tick():
+    scene = bpy.context.scene
+    if not scene or not hasattr(scene, "drone_flight_recorder_settings"):
+        return 1.0
+    if RUNTIME.timer_running:
+        return 2.0
+    now = time.monotonic()
+    if now - RUNTIME.auto_arm_last_try < 1.0:
+        return 1.0
+    RUNTIME.auto_arm_last_try = now
+    try:
+        if auto_arm_if_controller_present(bpy.context):
+            return 2.0
+        RUNTIME.auto_arm_failures += 1
+    except Exception as ex:
+        scene.drone_flight_recorder_settings.status = "AirBlender autosense error: %s" % ex
+        RUNTIME.auto_arm_failures += 1
+    return 1.0 if RUNTIME.auto_arm_failures < 10 else 3.0
+
+
+def ensure_auto_arm_runtime():
+    if RUNTIME.auto_arm_running:
+        return True
+    RUNTIME.auto_arm_running = True
+    bpy.app.timers.register(_auto_arm_tick, first_interval=1.0, persistent=True)
+    return True
+
+
 def _draw_controller_icon():
     try:
         x, y, w, h = RUNTIME.icon_region
         font_id = 0
-        blf.size(font_id, 26)
-        blf.color(font_id, 1.0, 1.0, 1.0, 0.48)
-        blf.position(font_id, x, y, 0)
+        active = bool(RUNTIME.timer_running)
+        alpha = 0.78 if active else 0.50
+        blf.size(font_id, 28)
+        blf.color(font_id, 0.72, 0.90, 1.0, alpha)
+        blf.position(font_id, x, y + 8, 0)
         blf.draw(font_id, "🎮")
-        blf.size(font_id, 10)
-        blf.color(font_id, 1.0, 1.0, 1.0, 0.42)
-        blf.position(font_id, x + 4, y - 10, 0)
-        blf.draw(font_id, "Air")
+        blf.size(font_id, 12)
+        blf.color(font_id, 0.72, 0.90, 1.0, alpha)
+        blf.position(font_id, x, y - 8, 0)
+        blf.draw(font_id, "AirBlender")
     except Exception:
         pass
 
@@ -1912,9 +1996,10 @@ class LAB_OT_icon_runtime(bpy.types.Operator):
             x, y, w, h = RUNTIME.icon_region
             mx = getattr(event, "mouse_region_x", -9999)
             my = getattr(event, "mouse_region_y", -9999)
-            if x - 6 <= mx <= x + w and y - 16 <= my <= y + h:
+            if x - 10 <= mx <= x + w and y - 18 <= my <= y + h:
                 if event.type == "LEFTMOUSE":
-                    bpy.ops.lab.activate()
+                    if not RUNTIME.timer_running:
+                        auto_arm_if_controller_present(context) or bpy.ops.lab.activate()
                 else:
                     bpy.ops.wm.call_menu(name="LAB_MT_controller_controls")
                 return {"RUNNING_MODAL"}
@@ -1924,6 +2009,7 @@ class LAB_OT_icon_runtime(bpy.types.Operator):
 
 
 def ensure_icon_runtime():
+    ensure_auto_arm_runtime()
     if RUNTIME.icon_running:
         return True
     def _start():
