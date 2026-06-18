@@ -1,5 +1,13 @@
 # Changelog
 
+## v1.0.3
+
+- Finalized the controller-first AirBlender flight workflow: A toggles the controller controls overlay, B toggles the third-person side pane, R3 toggles portrait/landscape, Select single-taps through takes and double-taps to a new/empty take, and Start cycles cameras in numeric order with a shorter double-tap window.
+- Fixed live hotplug by requiring real `/dev/input/js*` connectivity on Linux instead of treating a waiting UDP bridge socket as a connected controller.
+- Improved recording overwrite behavior after rewinding/scrubbing and added L3+trigger focal-length control with recorded lens keyframes.
+- Added subtle drone-style inertia and visual bank lag while keeping the rig path level and responsive.
+- Removed duplicate/header AirBlender controls; the bottom icon is status-only and controls are shown by the controller.
+
 ## v1.0.2
 
 - Fixed Linux autosense sessions where a stale UDP bridge could outrank the real `/dev/input/js*` controller, leaving the AirBlender icon/status armed while physical buttons such as Start did nothing. Native Linux joystick input now wins whenever Blender can see it.

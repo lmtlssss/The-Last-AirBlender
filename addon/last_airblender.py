@@ -1,7 +1,7 @@
 bl_info = {
     "name": "The Last AirBlender",
     "author": "Codex",
-    "version": (1, 0, 2),
+    "version": (1, 0, 3),
     "blender": (4, 0, 0),
     "location": "View3D > Sidebar > The Last AirBlender",
     "description": "Fly Blender cameras with an Xbox-style controller and record cinematic camera takes.",
@@ -18,6 +18,7 @@ import fcntl
 import array
 import json
 import socket
+import re
 from mathutils import Vector, Matrix, Quaternion
 import blf
 
@@ -269,15 +270,20 @@ class HybridJoystickBackend:
         self.error = ""
 
     def open(self, preferred_path=""):
-        bridge_ok = self.bridge.open(preferred_path)
+        self.close()
         linux_ok = self.linux.open(preferred_path) if os.name == "posix" else False
+        if linux_ok:
+            self.active = self.linux
+            self._sync_status()
+            return True
+        bridge_ok = self.bridge.open(preferred_path)
         if not bridge_ok and not linux_ok:
             self.error = self.bridge.error or self.linux.error or "no controller backend available"
             self.connected = False
             return False
-        self.active = self.linux if linux_ok else self.bridge
+        self.active = self.bridge if bridge_ok else None
         self._sync_status()
-        return True
+        return bool(self.connected)
 
     def close(self):
         self.bridge.close()
@@ -290,16 +296,11 @@ class HybridJoystickBackend:
             self.active = self.linux
         elif self.bridge.connected:
             self.active = self.bridge
-        elif self.bridge.sock is not None:
-            self.active = self.bridge
+        else:
+            self.active = None
         self.path = getattr(self.active, "path", "") if self.active else ""
         self.name = getattr(self.active, "name", "") if self.active else ""
         self.connected = bool(getattr(self.active, "connected", False)) if self.active else False
-        if self.bridge.sock is not None and not self.connected:
-            # Keep waiting for Rust bridge packets instead of aborting immediately.
-            self.connected = True
-            self.path = self.bridge.path
-            self.name = self.bridge.name
         self.error = getattr(self.active, "error", "") if self.active else ""
 
     def poll(self):
@@ -333,6 +334,8 @@ class DroneRuntime:
         self.scene_name = ""
         self.pitch_angle = 0.0
         self.roll_angle = 0.0
+        self.physics_desired_velocity = Vector((0, 0, 0))
+        self.visual_bank_angle = 0.0
         self.dpad_up_active = False
         self.dpad_down_active = False
         self.dpad_left_active = False
@@ -349,12 +352,19 @@ class DroneRuntime:
         self.last_start_tap = -999.0
         self.pending_start_single = False
         self.pending_start_time = 0.0
+        self.last_select_tap = -999.0
+        self.pending_select_single = False
+        self.pending_select_time = 0.0
         self.icon_draw_handler = None
         self.icon_running = False
         self.icon_region = (22, 34, 112, 54)
         self.auto_arm_running = False
         self.auto_arm_last_try = 0.0
         self.auto_arm_failures = 0
+        self.controller_status_probe = 0.0
+        self.controller_status_available = False
+        self.controller_status_reason = ""
+        self.controls_overlay_visible = False
 
 
 
@@ -370,6 +380,8 @@ def _start_recording(scene):
     s = scene.drone_flight_recorder_settings
     ensure_take_actions(scene, int(s.active_take_slot))
     if not s.recording:
+        take_max = max_recorded_frame_for_active_take()
+        RUNTIME.record_max_frame = max(int(RUNTIME.record_max_frame), int(take_max), int(scene.frame_current))
         if scene.frame_current < int(RUNTIME.record_max_frame) or RUNTIME.record_rewound or RUNTIME.record_scrub_hold:
             delete_recorded_keys_after_frame(scene, scene.frame_current, include_current=True)
         s.recording = True
@@ -402,6 +414,12 @@ def _resume_recording_overwrite(scene):
     scene.drone_flight_recorder_settings.recording = True
     insert_record_key(scene, force=True)
     scene.drone_flight_recorder_settings.status = "REC overwrite | Take %d/%d | frame %d" % (int(scene.drone_flight_recorder_settings.active_take_slot), TAKE_SLOT_COUNT, int(scene.frame_current))
+
+
+def should_overwrite_from_current_frame(scene):
+    take_max = max_recorded_frame_for_active_take()
+    max_frame = max(int(RUNTIME.record_max_frame), int(take_max))
+    return bool((RUNTIME.record_rewound or RUNTIME.record_scrub_hold or int(scene.frame_current) < max_frame) and max_frame > int(scene.frame_start))
 
 
 def process_control_command(scene):
@@ -502,9 +520,115 @@ def configure_drone_split_view_layout(context=None):
     return True
 
 
-def _toggle_first_third_person(scene):
+def _screen_and_view_areas(context=None):
+    ctx = context or bpy.context
+    screen = getattr(ctx, "screen", None)
+    if screen is None and bpy.context.window_manager.windows:
+        screen = bpy.context.window_manager.windows[0].screen
+    if screen is None:
+        return None, []
+    return screen, [a for a in screen.areas if a.type == "VIEW_3D"]
+
+
+def toggle_camera_orientation(scene):
     s = scene.drone_flight_recorder_settings
-    return _set_first_person_view(scene, not s.first_person_view)
+    r = scene.render
+    x = max(1, int(r.resolution_x))
+    y = max(1, int(r.resolution_y))
+    if x >= y:
+        r.resolution_x, r.resolution_y = min(x, y), max(x, y)
+        mode = "portrait"
+    else:
+        r.resolution_x, r.resolution_y = max(x, y), min(x, y)
+        mode = "landscape"
+    s.status = "Camera mode: %s %dx%d" % (mode, int(r.resolution_x), int(r.resolution_y))
+    return mode
+
+
+def adjust_camera_focal_length(scene, amount, frame=None):
+    cam = scene.camera
+    if not cam or not getattr(cam, "data", None):
+        return False
+    data = cam.data
+    old = float(data.lens)
+    data.lens = max(5.0, min(300.0, old + float(amount)))
+    if abs(float(data.lens) - old) > 1e-5:
+        if frame is not None:
+            try:
+                data.keyframe_insert(data_path="lens", frame=frame)
+                ensure_linear_interpolation(data)
+            except Exception:
+                pass
+        scene.drone_flight_recorder_settings.status = "Focal length %.1fmm" % float(data.lens)
+        return True
+    return False
+
+
+def toggle_third_person_side_pane(context=None):
+    ctx = context or bpy.context
+    scene = ctx.scene
+    s = scene.drone_flight_recorder_settings
+    screen, view_areas = _screen_and_view_areas(ctx)
+    if screen is None or not view_areas:
+        s.status = "Side pane toggle failed: no 3D viewport"
+        return False
+    if len(view_areas) < 2:
+        # Create the old AirBlender side-by-side mode: large camera pane with a
+        # smaller third-person pane on the right.
+        area = max(view_areas, key=lambda a: a.width * a.height)
+        region = next((r for r in area.regions if r.type == "WINDOW"), None)
+        if region:
+            try:
+                with bpy.context.temp_override(area=area, region=region, screen=screen):
+                    bpy.ops.screen.area_split(direction="VERTICAL", factor=0.68)
+            except Exception:
+                pass
+        configure_drone_split_view_layout(ctx)
+        s.first_person_view = False
+        s.status = "Third-person side pane ON"
+        return True
+
+    # Close the smaller 3D side pane when possible. If Blender refuses the join
+    # because the layout is non-adjacent, fall back to reasserting the split roles.
+    ranked = sorted(view_areas, key=lambda a: a.width * a.height, reverse=True)
+    camera_area = ranked[0]
+    side_area = ranked[-1]
+    try:
+        sx = int(side_area.x + side_area.width * 0.5)
+        sy = int(side_area.y + side_area.height * 0.5)
+        tx = int(camera_area.x + camera_area.width * 0.5)
+        ty = int(camera_area.y + camera_area.height * 0.5)
+        with bpy.context.temp_override(area=side_area, screen=screen):
+            bpy.ops.screen.area_join(source_xy=(sx, sy), target_xy=(tx, ty))
+        configure_drone_split_view_layout(ctx)
+        s.first_person_view = True
+        s.status = "Third-person side pane OFF"
+        return True
+    except Exception:
+        ok = configure_drone_split_view_layout(ctx)
+        s.first_person_view = False
+        s.status = "Third-person side pane ON"
+        return ok
+
+
+def _toggle_first_third_person(scene):
+    # Back-compat name: this is now B's side-pane mode.
+    return toggle_third_person_side_pane(bpy.context)
+
+
+def _button_a_camera_mode(scene):
+    return toggle_camera_orientation(scene)
+
+
+def _button_b_side_pane_mode(scene):
+    return toggle_third_person_side_pane(bpy.context)
+
+
+def toggle_controls_overlay(scene):
+    s = scene.drone_flight_recorder_settings
+    RUNTIME.controls_overlay_visible = not bool(RUNTIME.controls_overlay_visible)
+    s.status = "AirBlender controls %s" % ("shown" if RUNTIME.controls_overlay_visible else "hidden")
+    return RUNTIME.controls_overlay_visible
 
 
 def _drone_screenshot_base_dir(scene=None):
@@ -604,6 +728,12 @@ GLOBAL_SENSITIVITY_MULTIPLIERS = (0.35, 0.80, 1.60, 3.10)
 # so left strafe/climb/descend matches right-stick steering fluency.
 LEFT_STICK_SENSITIVITY_MULTIPLIERS = (1.20, 2.50, 5.00, 9.00)
 BUMPER_VERTICAL_SPEED_FACTOR = 0.75
+STOCK_AXIS_SIGNS = {
+    "left_x": 1.0,    # stick right = strafe right
+    "left_y": -1.0,   # Linux js reports stick-up negative; normalize to forward
+    "right_x": -1.0,  # stick right = look right
+    "right_y": -1.0,  # stick up = look up
+}
 
 
 def global_sensitivity_multiplier(settings_obj):
@@ -626,11 +756,19 @@ def left_stick_movement_multiplier(settings_obj):
     return left_stick_sensitivity_multiplier(settings_obj) * float(settings_obj.left_stick_gain)
 
 
+def stock_axis_value(settings_obj, axis_prop_name, logical_name):
+    v = RUNTIME.backend.axis(getattr(settings_obj, axis_prop_name))
+    v *= STOCK_AXIS_SIGNS.get(logical_name, 1.0)
+    if effective_toggle_invert(False, settings_obj.joystick_invert_mode, logical_name):
+        v = -v
+    return deadzone_value(v, settings_obj.deadzone)
+
+
 def effective_toggle_invert(base_invert, mode, axis_name):
-    # OFF is true stock/no-invert. ON is one global inverted-pilot toggle.
-    # It flips both sticks; trigger/roll direction is flipped separately where
-    # roll_input is computed.
-    flip = bool(int(mode) % 2) and axis_name in {"left_x", "left_y", "right_x", "right_y"}
+    # OFF is true stock/no-invert after hardware sign normalization.
+    # ON is the intentional inverted-pilot toggle and only flips the right/look
+    # stick. Left movement stays standard: left/right strafe, up/down forward/back.
+    flip = bool(int(mode) % 2) and axis_name in {"right_x", "right_y"}
     return bool(base_invert) ^ flip
 
 
@@ -726,7 +864,7 @@ def ensure_linear_interpolation(obj):
     if not ad or not ad.action:
         return
     for fc in iter_action_fcurves(ad.action):
-        if fc.data_path in {"location", "rotation_euler"}:
+        if fc.data_path in {"location", "rotation_euler", "lens"}:
             for kp in fc.keyframe_points:
                 kp.interpolation = "LINEAR"
 
@@ -751,6 +889,19 @@ def delete_recorded_keys_after_frame(scene, frame, include_current=False):
             except Exception:
                 pass
     # Remove DFR marker/key-pose markers in the discarded future.
+    if scene.camera and scene.camera.data and scene.camera.data.animation_data and scene.camera.data.animation_data.action:
+        action = scene.camera.data.animation_data.action
+        for fc in iter_action_fcurves(action):
+            if fc.data_path != "lens":
+                continue
+            for kp in reversed(list(fc.keyframe_points)):
+                if (kp.co.x >= frame - eps) if include_current else (kp.co.x > frame + eps):
+                    fc.keyframe_points.remove(kp)
+                    removed += 1
+            try:
+                fc.update()
+            except Exception:
+                pass
     for m in list(scene.timeline_markers):
         if ((m.frame >= frame) if include_current else (m.frame > frame)) and (m.name.startswith("LAB_") or m.name.startswith("DFR_")):
             scene.timeline_markers.remove(m)
@@ -854,14 +1005,17 @@ def switch_take_slot(scene, slot):
     slot = max(1, min(TAKE_SLOT_COUNT, int(slot)))
     had_keys = active_take_has_keys(scene, slot)
     ensure_take_actions(scene, slot)
+    scene.frame_set(scene.frame_start)
+    bpy.context.view_layer.update()
     if had_keys:
-        scene.frame_set(scene.frame_start)
-        bpy.context.view_layer.update()
         sync_runtime_from_rig_pose()
         RUNTIME.record_max_frame = max_recorded_frame_for_active_take()
     else:
-        RUNTIME.record_max_frame = int(scene.frame_current)
+        RUNTIME.record_max_frame = int(scene.frame_start)
         sync_runtime_from_rig_pose()
+    RUNTIME.record_rewound = False
+    RUNTIME.record_scrub_hold = False
+    RUNTIME.record_waiting_for_input = False
     scene.drone_flight_recorder_settings.status = "Take %d/%d selected%s" % (slot, TAKE_SLOT_COUNT, "" if had_keys else " (empty)")
     return True
 
@@ -971,7 +1125,7 @@ class DroneFlightSettings(bpy.types.PropertyGroup):
     last_screenshot_path: bpy.props.StringProperty(name="Last Screenshot", default="")
     joystick_invert_mode: bpy.props.IntProperty(name="Joystick Invert", default=0, min=0, max=1)
     active_take_slot: bpy.props.IntProperty(name="Active Take", default=1, min=1, max=10)
-    start_double_tap_window: bpy.props.FloatProperty(name="Start Double Tap sec", default=0.35, min=0.05, max=1.5)
+    start_double_tap_window: bpy.props.FloatProperty(name="Double Tap sec", default=0.20, min=0.05, max=0.8)
 
     max_speed: bpy.props.FloatProperty(name="Max Speed", default=2.0, min=0.01, soft_max=20.0, unit="VELOCITY")
     vertical_speed: bpy.props.FloatProperty(name="Vertical Speed", default=1.2, min=0.01, soft_max=10.0)
@@ -980,6 +1134,7 @@ class DroneFlightSettings(bpy.types.PropertyGroup):
     yaw_speed: bpy.props.FloatProperty(name="Yaw Speed deg/s", default=70.0, min=1.0, soft_max=360.0)
     gimbal_speed: bpy.props.FloatProperty(name="Gimbal Speed deg/s", default=55.0, min=1.0, soft_max=180.0)
     roll_speed: bpy.props.FloatProperty(name="Roll Speed deg/s", default=70.0, min=1.0, soft_max=360.0)
+    focal_length_speed: bpy.props.FloatProperty(name="Focal Length Speed mm/s", default=55.0, min=1.0, soft_max=300.0)
     roll_auto_level: bpy.props.BoolProperty(name="Auto-Level Roll", default=False)
     roll_return_speed: bpy.props.FloatProperty(name="Roll Return deg/s", default=120.0, min=1.0, soft_max=720.0)
     bumper_double_tap_window: bpy.props.FloatProperty(name="Bumper Multi-Tap Window sec", default=0.35, min=0.05, max=1.5)
@@ -990,6 +1145,8 @@ class DroneFlightSettings(bpy.types.PropertyGroup):
     unlimited_pitch: bpy.props.BoolProperty(name="Unlimited Pitch Orbit", default=True)
     acceleration: bpy.props.FloatProperty(name="Acceleration", default=45.0, min=0.01, soft_max=160.0)
     drag: bpy.props.FloatProperty(name="Drag", default=1.2, min=0.0, soft_max=20.0)
+    inertia: bpy.props.FloatProperty(name="Subtle Inertia", default=0.18, min=0.0, max=0.65)
+    bank_lag: bpy.props.FloatProperty(name="Visual Bank Lag", default=0.20, min=0.0, max=1.0)
     deadzone: bpy.props.FloatProperty(name="Deadzone", default=0.12, min=0.0, max=0.8)
     smoothing: bpy.props.FloatProperty(name="Smoothing", default=10.0, min=0.0, soft_max=30.0)
     banking: bpy.props.FloatProperty(name="Banking deg", default=7.0, min=0.0, soft_max=45.0)
@@ -1025,6 +1182,8 @@ class DroneFlightSettings(bpy.types.PropertyGroup):
     button_rb: bpy.props.IntProperty(name="Button RB", default=5, min=0, max=63)
     button_select: bpy.props.IntProperty(name="Button Select/Back", default=6, min=0, max=63)
     button_start: bpy.props.IntProperty(name="Button Start/Menu", default=7, min=0, max=63)
+    button_l3: bpy.props.IntProperty(name="Button L3", default=9, min=0, max=63)
+    button_r3: bpy.props.IntProperty(name="Button R3", default=10, min=0, max=63)
 
     show_mapping: bpy.props.BoolProperty(name="Show Mapping", default=False)
 
@@ -1114,10 +1273,13 @@ class DFR_OT_create_rig(bpy.types.Operator):
 
 
 def lab_cameras(scene):
+    def key(o):
+        m = re.match(r"^%s_(\d+)$" % re.escape(LAB_CAMERA_PREFIX), o.name)
+        numbered = int(m.group(1)) if m else 10**9
+        tagged = 0 if o.get("lab_camera") else 1
+        return (tagged, numbered, o.name.lower())
     cams = [o for o in bpy.data.objects if o.type == "CAMERA"]
-    tagged = sorted([c for c in cams if c.get("lab_camera")], key=lambda o: o.name)
-    untagged = sorted([c for c in cams if not c.get("lab_camera")], key=lambda o: o.name)
-    return tagged + untagged
+    return sorted(cams, key=key)
 
 
 def active_view_matrix(context=None):
@@ -1172,21 +1334,22 @@ def create_airblender_camera(scene, context=None):
 
 def switch_airblender_camera(scene, direction=1, context=None):
     context = context or bpy.context
-    cams = lab_cameras(scene)
-    if not cams:
-        return create_airblender_camera(scene, context)
     current = scene.camera
     if current and current.type == "CAMERA":
         current["lab_camera"] = True
         _detach_camera_preserve_world(current)
+    cams = lab_cameras(scene)
+    if not cams:
+        return create_airblender_camera(scene, context)
     try:
         idx = cams.index(current)
     except ValueError:
         idx = -1 if direction > 0 else 0
-    cam = cams[(idx + direction) % len(cams)]
+    new_idx = (idx + direction) % len(cams)
+    cam = cams[new_idx]
     scene.camera = cam
     bpy.ops.dfr.create_rig()
-    scene.drone_flight_recorder_settings.status = "Camera %d/%d: %s" % (((idx + direction) % len(cams)) + 1, len(cams), cam.name)
+    scene.drone_flight_recorder_settings.status = "Camera %d/%d: %s" % (new_idx + 1, len(cams), cam.name)
     return cam
 
 
@@ -1214,6 +1377,52 @@ def process_pending_start_single(scene, now):
     if (now - RUNTIME.pending_start_time) >= window:
         RUNTIME.pending_start_single = False
         switch_airblender_camera(scene, 1, bpy.context)
+
+
+def create_or_switch_new_take_slot(scene):
+    s = scene.drone_flight_recorder_settings
+    if s.recording:
+        s.status = "Finish recording before creating/switching takes"
+        return False
+    start = int(s.active_take_slot)
+    chosen = None
+    for offset in range(1, TAKE_SLOT_COUNT + 1):
+        slot = ((start + offset - 1) % TAKE_SLOT_COUNT) + 1
+        if not active_take_has_keys(scene, slot):
+            chosen = slot
+            break
+    if chosen is None:
+        chosen = (start % TAKE_SLOT_COUNT) + 1
+    ok = switch_take_slot(scene, chosen)
+    if ok:
+        s.status = "New/empty take %d/%d selected" % (int(s.active_take_slot), TAKE_SLOT_COUNT)
+    return ok
+
+
+def handle_select_button_edge(scene, now):
+    s = scene.drone_flight_recorder_settings
+    if s.recording:
+        s.status = "Select ignored while recording"
+        RUNTIME.pending_select_single = False
+        return
+    window = max(0.05, float(s.start_double_tap_window))
+    if (now - RUNTIME.last_select_tap) <= window:
+        RUNTIME.pending_select_single = False
+        RUNTIME.last_select_tap = -999.0
+        create_or_switch_new_take_slot(scene)
+    else:
+        RUNTIME.pending_select_single = True
+        RUNTIME.pending_select_time = now
+        RUNTIME.last_select_tap = now
+
+
+def process_pending_select_single(scene, now):
+    if not RUNTIME.pending_select_single:
+        return
+    window = max(0.05, float(scene.drone_flight_recorder_settings.start_double_tap_window))
+    if (now - RUNTIME.pending_select_time) >= window:
+        RUNTIME.pending_select_single = False
+        switch_take_slot(scene, (int(scene.drone_flight_recorder_settings.active_take_slot) % TAKE_SLOT_COUNT) + 1)
 
 
 def _trigger_value(v, deadzone):
@@ -1249,15 +1458,17 @@ def _flight_step(scene):
         return val and not old
 
     if edge(s.button_a):
-        _toggle_first_third_person(scene)
+        toggle_controls_overlay(scene)
+    if edge(s.button_b):
+        _button_b_side_pane_mode(scene)
     if edge(s.button_select):
-        if s.recording:
-            s.status = "Select ignored while recording"
-        else:
-            switch_take_slot(scene, (int(s.active_take_slot) % TAKE_SLOT_COUNT) + 1)
+        handle_select_button_edge(scene, now)
     if edge(s.button_start):
         handle_start_button_edge(scene, now)
+    if edge(s.button_r3):
+        _button_a_camera_mode(scene)
     process_pending_start_single(scene, now)
+    process_pending_select_single(scene, now)
 
     dpad_y = RUNTIME.backend.axis(s.axis_dpad_y)
     up_edge, RUNTIME.dpad_up_active = _dpad_edge(dpad_y, s.dpad_up_direction or -1, RUNTIME.dpad_up_active)
@@ -1270,6 +1481,8 @@ def _flight_step(scene):
             _resume_recording_overwrite(scene)
         elif s.recording:
             _stop_recording(scene)
+        elif should_overwrite_from_current_frame(scene):
+            _resume_recording_overwrite(scene)
         else:
             _start_recording(scene)
         return
@@ -1320,10 +1533,12 @@ def _flight_step(scene):
     lb_edge = edge(s.button_lb)
     rb_edge = edge(s.button_rb)
 
+    bumper_sign = -1.0 if int(s.joystick_invert_mode) % 2 else 1.0
+
     def bumper_auto_tap(button_idx, direction):
         if direction == 0.0:
             return
-        direction = 1.0 if direction > 0.0 else -1.0
+        direction = (1.0 if direction > 0.0 else -1.0) * bumper_sign
         last = RUNTIME.last_bumper_tap.get(button_idx, -999.0)
         window = max(0.05, float(s.bumper_double_tap_window))
         is_double = (now - last) <= window
@@ -1340,9 +1555,12 @@ def _flight_step(scene):
             RUNTIME.bumper_tap_count = {}
             return
 
-        # Automove on: every bumper tap reverses direction. No old per-bumper
-        # speed cycling; X is now the only speed selector.
-        set_auto_throttle_level(s, -current_dir if current_dir else direction)
+        # Automove on: tapping the opposite bumper reverses/goes back; tapping
+        # the same direction again stops autoscroll.
+        if current_dir and direction == current_dir:
+            clear_auto_throttle_state()
+        else:
+            set_auto_throttle_level(s, direction)
         RUNTIME.last_bumper_tap = {button_idx: now}
         RUNTIME.bumper_tap_count = {}
 
@@ -1351,24 +1569,18 @@ def _flight_step(scene):
     if lb_edge:
         bumper_auto_tap(s.button_lb, -1.0)
 
-    brake = b(s.button_b)
+    brake = False
     button_back = b(s.button_lb)
     button_forward = b(s.button_rb)
     if button_back and button_forward:
         clear_auto_throttle_state()
     mult = 1.0
 
-    def ax(idx, inv=False):
-        v = RUNTIME.backend.axis(idx)
-        if inv:
-            v = -v
-        return deadzone_value(v, s.deadzone)
-
     raw = {
-        "lx": ax(s.axis_left_x, effective_toggle_invert(s.invert_left_x, s.joystick_invert_mode, "left_x")),
-        "ly": ax(s.axis_left_y, effective_toggle_invert(s.invert_left_y, s.joystick_invert_mode, "left_y")),
-        "rx": ax(s.axis_right_x, effective_toggle_invert(s.invert_right_x, s.joystick_invert_mode, "right_x")),
-        "ry": ax(s.axis_right_y, effective_toggle_invert(s.invert_right_y, s.joystick_invert_mode, "right_y")),
+        "lx": stock_axis_value(s, "axis_left_x", "left_x"),
+        "ly": stock_axis_value(s, "axis_left_y", "left_y"),
+        "rx": stock_axis_value(s, "axis_right_x", "right_x"),
+        "ry": stock_axis_value(s, "axis_right_y", "right_y"),
         "lt": _trigger_value(RUNTIME.backend.axis(s.axis_left_trigger), s.deadzone),
         "rt": _trigger_value(RUNTIME.backend.axis(s.axis_right_trigger), s.deadzone),
     }
@@ -1387,13 +1599,16 @@ def _flight_step(scene):
     pitch_input = RUNTIME.filtered["ry"]
     strafe = RUNTIME.filtered["lx"]
     forward_back = RUNTIME.filtered["ly"]
-    roll_input = RUNTIME.filtered["lt"] - RUNTIME.filtered["rt"]
+    l3_held = b(s.button_l3)
+    trigger_sign = -1.0 if int(s.joystick_invert_mode) % 2 else 1.0
+    focal_input = trigger_sign * (RUNTIME.filtered["rt"] - RUNTIME.filtered["lt"]) if l3_held else 0.0
+    roll_input = 0.0 if l3_held else (RUNTIME.filtered["lt"] - RUNTIME.filtered["rt"])
     if int(s.joystick_invert_mode) % 2:
         roll_input = -roll_input
-    manual_throttle = ((1.0 if button_forward else 0.0) - (1.0 if button_back else 0.0))
+    manual_throttle = bumper_sign * ((1.0 if button_forward else 0.0) - (1.0 if button_back else 0.0))
     throttle = RUNTIME.auto_throttle if abs(RUNTIME.auto_throttle) > 0.0 else manual_throttle
 
-    pilot_active = pilot_has_control_input(yaw_input, pitch_input, strafe, forward_back, roll_input, throttle)
+    pilot_active = pilot_has_control_input(yaw_input, pitch_input, strafe, forward_back, roll_input, throttle) or abs(focal_input) > 1e-4
     if s.recording and (RUNTIME.record_scrub_hold or RUNTIME.record_waiting_for_input) and not pilot_active:
         RUNTIME.velocity = Vector((0, 0, 0))
         RUNTIME.yaw_rate = 0.0
@@ -1443,6 +1658,8 @@ def _flight_step(scene):
 
     # LT/RT are analog visual barrel-roll/bank controls on the dedicated Drone_Roll node.
     # By default roll latches where the pilot leaves it; optional auto-level is available in settings.
+    if abs(focal_input) > 1e-5:
+        adjust_camera_focal_length(scene, focal_input * float(s.focal_length_speed) * dt, scene.frame_current if s.recording else None)
     roll_delta = roll_input * math.radians(s.roll_speed) * dt * sense
     if abs(roll_input) > 1e-5:
         RUNTIME.roll_angle += roll_delta
@@ -1452,36 +1669,53 @@ def _flight_step(scene):
             RUNTIME.roll_angle = 0.0
         else:
             RUNTIME.roll_angle -= math.copysign(step, RUNTIME.roll_angle)
-    if roll:
-        roll.rotation_euler.x = 0.0
-        roll.rotation_euler.y = 0.0
-        roll.rotation_euler.z = float(roll.get("dfr_base_z", 0.0)) + RUNTIME.roll_angle
-    try:
-        bpy.context.view_layer.update()
-    except Exception:
-        pass
-
     # Direction of travel is pegged to the perspective. Use the rolled camera
     # frame so left/right/forward/back match the tilted viewport image while banked.
     view_obj = roll or gimbal
     q = view_obj.matrix_world.to_quaternion()
     view_vec = (q @ Vector((0, 0, -1))).normalized()
     right_vec = (q @ Vector((1, 0, 0))).normalized()
-    up_vec = Vector((0, 0, 1))
+    up_vec = (q @ Vector((0, 1, 0))).normalized()
     left_move_speed = s.max_speed * left_stick_movement_multiplier(s)
     # Bumper rise/fall uses the same movement speed as the left stick so
     # vertical control no longer feels lethargic relative to strafe/forward.
     desired = (view_vec * (forward_back * left_move_speed * mult) +
                right_vec * (strafe * left_move_speed * mult) +
                up_vec * (throttle * left_move_speed * BUMPER_VERTICAL_SPEED_FACTOR * mult))
-    diff = desired - RUNTIME.velocity
-    max_delta = s.acceleration * mult * dt
+    # Subtle drone feel: keep a little desired-velocity memory so stick release
+    # has smooth momentum instead of a hard noclip stop. Defaults are deliberately
+    # low; the camera should still feel responsive.
+    inertia = max(0.0, min(0.65, float(s.inertia)))
+    follow_rate = max(1.0, float(s.smoothing) * (1.0 - inertia) + 2.0)
+    RUNTIME.physics_desired_velocity = Vector((
+        smooth_value(RUNTIME.physics_desired_velocity.x, desired.x, follow_rate, dt),
+        smooth_value(RUNTIME.physics_desired_velocity.y, desired.y, follow_rate, dt),
+        smooth_value(RUNTIME.physics_desired_velocity.z, desired.z, follow_rate, dt),
+    ))
+    desired_physics = RUNTIME.physics_desired_velocity
+    diff = desired_physics - RUNTIME.velocity
+    max_delta = s.acceleration * mult * dt * (0.72 + 0.28 * (1.0 - inertia))
     if diff.length > max_delta and diff.length > 1e-6:
         RUNTIME.velocity += diff.normalized() * max_delta
     else:
-        RUNTIME.velocity = desired
-    RUNTIME.velocity *= max(0.0, 1.0 - s.drag * dt * (0.25 if desired.length > 0.001 else 1.0))
+        RUNTIME.velocity = desired_physics
+    drag_scale = 0.18 if desired.length > 0.001 else 0.62
+    RUNTIME.velocity *= max(0.0, 1.0 - s.drag * dt * drag_scale)
     rig.location += RUNTIME.velocity * dt
+
+    # Tiny visual banking/lag for drone feel. It is applied only to the roll
+    # display node and never feeds back into the rig path. Manual roll still wins.
+    target_bank = 0.0 if abs(roll_input) > 1e-5 else math.radians(float(s.banking)) * (-strafe * 0.70 - yaw_input * 0.30)
+    bank_rate = max(1.0, float(s.smoothing) * (1.0 - max(0.0, min(1.0, float(s.bank_lag))) * 0.75))
+    RUNTIME.visual_bank_angle = smooth_value(RUNTIME.visual_bank_angle, target_bank, bank_rate, dt)
+    if roll:
+        roll.rotation_euler.x = 0.0
+        roll.rotation_euler.y = 0.0
+        roll.rotation_euler.z = float(roll.get("dfr_base_z", 0.0)) + RUNTIME.roll_angle + RUNTIME.visual_bank_angle
+    try:
+        bpy.context.view_layer.update()
+    except Exception:
+        pass
 
     if s.recording:
         RUNTIME.record_tick += 1
@@ -1528,6 +1762,13 @@ def start_controller_flight(context, reporter=None):
             reporter({"ERROR"}, "Could not create/find AirBlender rig/gimbal")
         return False
     s = settings(context)
+    # Do not let old saved .blend/session mapping experiments silently become
+    # the stock load. AirBlender ships one baked mapping; Y toggles only the
+    # explicit right-stick/roll invert mode.
+    s.invert_left_x = False
+    s.invert_left_y = False
+    s.invert_right_x = False
+    s.invert_right_y = False
     if not RUNTIME.backend.open(s.controller_device):
         s.controller_connected = False
         s.status = "Controller error: " + RUNTIME.backend.error
@@ -1537,6 +1778,7 @@ def start_controller_flight(context, reporter=None):
     s.controller_device = RUNTIME.backend.path
     s.controller_connected = True
     ensure_take_actions(context.scene, int(s.active_take_slot))
+    RUNTIME.record_max_frame = max_recorded_frame_for_active_take()
     s.status = "Flying: %s (Take %d/%d, RB/LB rise/fall, RT/LT analog roll, viewport-locked right stick)" % (RUNTIME.backend.name, int(s.active_take_slot), TAKE_SLOT_COUNT)
     RUNTIME.operator = None
     RUNTIME.timer_running = True
@@ -1545,6 +1787,7 @@ def start_controller_flight(context, reporter=None):
     RUNTIME.last_time = time.monotonic()
     RUNTIME.last_buttons = dict(getattr(getattr(RUNTIME.backend, "active", RUNTIME.backend), "buttons", {}))
     RUNTIME.velocity = Vector((0, 0, 0))
+    RUNTIME.physics_desired_velocity = Vector((0, 0, 0))
     RUNTIME.yaw_rate = 0.0
     RUNTIME.record_tick = 0
     _rig, _gimbal = get_rig_objects()
@@ -1562,10 +1805,13 @@ def start_controller_flight(context, reporter=None):
     RUNTIME.dpad_right_active = False
     RUNTIME.auto_throttle = 0.0
     RUNTIME.auto_throttle_level = 0
+    RUNTIME.visual_bank_angle = 0.0
     RUNTIME.last_bumper_tap = {}
     RUNTIME.bumper_tap_count = {}
     RUNTIME.pending_start_single = False
     RUNTIME.last_start_tap = -999.0
+    RUNTIME.pending_select_single = False
+    RUNTIME.last_select_tap = -999.0
     bpy.app.timers.register(_flight_timer_tick, first_interval=0.01, persistent=False)
     return True
 
@@ -1625,13 +1871,18 @@ class DFR_OT_start_flight(bpy.types.Operator):
             return val and not old
 
         if edge(s.button_a):
-            _toggle_first_third_person(context.scene)
+            toggle_controls_overlay(context.scene)
+        if edge(s.button_b):
+            _button_b_side_pane_mode(context.scene)
         if edge(s.button_x):
             level, mul = cycle_global_sensitivity(s)
             s.status = "Global sensitivity L%d x%.2f" % (level, mul)
         if edge(s.button_y):
-            insert_record_key(context.scene, force=True, marker=True)
-        brake = b(s.button_b)
+            label = toggle_joystick_invert_mode(s)
+            s.status = "Joystick invert: " + label
+        if edge(s.button_r3):
+            _button_a_camera_mode(context.scene)
+        brake = False
         precision = b(s.button_lb)
         boost = b(s.button_rb)
         mult = 1.0
@@ -1640,17 +1891,11 @@ class DFR_OT_start_flight(bpy.types.Operator):
         if boost:
             mult *= s.boost_multiplier
 
-        def ax(idx, inv=False):
-            v = RUNTIME.backend.axis(idx)
-            if inv:
-                v = -v
-            return deadzone_value(v, s.deadzone)
-
         raw = {
-            "lx": ax(s.axis_left_x, effective_toggle_invert(s.invert_left_x, s.joystick_invert_mode, "left_x")),
-            "ly": ax(s.axis_left_y, effective_toggle_invert(s.invert_left_y, s.joystick_invert_mode, "left_y")),
-            "rx": ax(s.axis_right_x, effective_toggle_invert(s.invert_right_x, s.joystick_invert_mode, "right_x")),
-            "ry": ax(s.axis_right_y, effective_toggle_invert(s.invert_right_y, s.joystick_invert_mode, "right_y")),
+            "lx": stock_axis_value(s, "axis_left_x", "left_x"),
+            "ly": stock_axis_value(s, "axis_left_y", "left_y"),
+            "rx": stock_axis_value(s, "axis_right_x", "right_x"),
+            "ry": stock_axis_value(s, "axis_right_y", "right_y"),
             "lt": (RUNTIME.backend.axis(s.axis_left_trigger) + 1.0) * 0.5,
             "rt": (RUNTIME.backend.axis(s.axis_right_trigger) + 1.0) * 0.5,
         }
@@ -1862,6 +2107,16 @@ class LAB_MT_controller_controls(bpy.types.Menu):
 
     def draw(self, context):
         layout = self.layout
+        available, reason = controller_live_available()
+        s = settings(context) if context.scene and hasattr(context.scene, "drone_flight_recorder_settings") else None
+        layout.label(text="Controller: %s" % ("available" if available else "not available"))
+        if reason:
+            layout.label(text=str(reason)[:64])
+        if s:
+            layout.label(text="Recording: %s" % ("ON" if s.recording else "off"))
+            layout.label(text="Take: %d / %d" % (s.active_take_slot, TAKE_SLOT_COUNT))
+            layout.label(text="Invert: " + joystick_invert_mode_label(s.joystick_invert_mode))
+        layout.separator()
         for text in CONTROL_HELP_LINES:
             layout.label(text=text)
         layout.separator()
@@ -1870,17 +2125,87 @@ class LAB_MT_controller_controls(bpy.types.Menu):
         layout.operator("dfr.toggle_recording", text="Toggle Recording", icon="REC")
 
 
+class LAB_PT_controls_popover(bpy.types.Panel):
+    bl_label = "The Last AirBlender Controls"
+    bl_idname = "LAB_PT_controls_popover"
+    bl_space_type = "VIEW_3D"
+    bl_region_type = "HEADER"
+    bl_ui_units_x = 18
+
+    def draw(self, context):
+        layout = self.layout
+        available, reason = controller_live_available()
+        s = settings(context) if context.scene and hasattr(context.scene, "drone_flight_recorder_settings") else None
+        layout.label(text="Controller: %s" % ("available" if available else "not available"))
+        if reason:
+            layout.label(text=str(reason)[:64])
+        if s:
+            layout.label(text="Recording: %s" % ("ON" if s.recording else "off"))
+            layout.label(text="Take: %d / %d" % (s.active_take_slot, TAKE_SLOT_COUNT))
+            layout.label(text="Invert: " + joystick_invert_mode_label(s.joystick_invert_mode))
+        layout.separator()
+        for text in CONTROL_HELP_LINES:
+            layout.label(text=text)
+        layout.separator()
+        row = layout.row(align=True)
+        row.operator("lab.activate", text="Activate Split View", icon="PLAY")
+        row.operator("dfr.stop_controller_flight", text="Stop", icon="PAUSE")
+        layout.operator("dfr.toggle_recording", text="Toggle Recording", icon="REC")
+
+
+def draw_airblender_header(self, context):
+    available, _reason = controller_live_available()
+    text = "🎮 AirBlender ●" if available else "🎮 AirBlender ○"
+    try:
+        self.layout.separator()
+        # Use a plain native Blender menu rather than a viewport overlay or
+        # popover. This gives real mouse hover/click/dropdown behavior.
+        self.layout.menu("LAB_MT_controller_controls", text=text)
+    except Exception:
+        pass
+
+
+def _is_primary_viewport_draw():
+    """Only draw the status mark in the main/largest 3D viewport.
+
+    SpaceView3D draw handlers run for every 3D viewport, so a split AirBlender
+    layout would otherwise show duplicate status icons in the side pane.
+    """
+    try:
+        import gpu
+        viewport = gpu.state.viewport_get()
+        cur_area = int(viewport[2]) * int(viewport[3])
+        screen = bpy.context.screen or (bpy.context.window.screen if bpy.context.window else None)
+        if not screen:
+            return True
+        areas = []
+        for area in screen.areas:
+            if area.type != "VIEW_3D":
+                continue
+            region = next((r for r in area.regions if r.type == "WINDOW"), None)
+            if region:
+                areas.append(int(region.width) * int(region.height))
+        if len(areas) <= 1:
+            return True
+        return cur_area >= (max(areas) * 0.95)
+    except Exception:
+        return True
+
+
 CONTROL_HELP_LINES = (
     "Start/Menu: cycle cameras",
     "Start/Menu double-tap: create camera",
-    "A: first/third-person view",
-    "B: brake",
+    "A: show/hide controls",
+    "B: toggle third-person side pane",
+    "R3: camera portrait/landscape",
     "X: speed low/medium/high/xhigh",
-    "Y: global invert",
+    "Y: invert right stick + trigger roll + bumpers",
     "Left stick: strafe + forward/back",
     "Right stick: viewport-locked look",
     "RB/LB: rise/fall; double-tap auto",
+    "Auto bumper: opposite reverses, same stops",
     "RT/LT: analog roll",
+    "L3 + RT/LT: camera focal length",
     "D-pad Up: camera screenshot",
     "D-pad Down: record/stop/overwrite",
     "D-pad Left/Right: scrub take",
@@ -1905,6 +2230,28 @@ def controller_available_for_autoarm():
     return False, "no Xbox-compatible controller visible to Blender"
 
 
+def controller_path_for_autoarm():
+    available, reason = controller_available_for_autoarm()
+    if not available:
+        return False, "", reason
+    return True, reason.split()[0], reason
+
+
+def controller_live_available():
+    backend_path = getattr(RUNTIME.backend, "path", "") or ""
+    if RUNTIME.timer_running and getattr(RUNTIME.backend, "connected", False) and not backend_path.startswith("udp://"):
+        RUNTIME.controller_status_available = True
+        RUNTIME.controller_status_reason = backend_path or "controller connected"
+        return True, RUNTIME.controller_status_reason
+    now = time.monotonic()
+    if now - RUNTIME.controller_status_probe >= 0.75:
+        RUNTIME.controller_status_probe = now
+        available, reason = controller_available_for_autoarm()
+        RUNTIME.controller_status_available = bool(available)
+        RUNTIME.controller_status_reason = reason
+    return bool(RUNTIME.controller_status_available), RUNTIME.controller_status_reason
+
+
 def ensure_scene_camera_for_autoarm(scene, context=None):
     context = context or bpy.context
     if scene.camera and scene.camera.type == "CAMERA":
@@ -1924,11 +2271,12 @@ def auto_arm_if_controller_present(context=None):
     if not scene or not hasattr(scene, "drone_flight_recorder_settings"):
         return False
     s = scene.drone_flight_recorder_settings
-    available, reason = controller_available_for_autoarm()
+    available, path, reason = controller_path_for_autoarm()
     if not available:
         s.controller_connected = False
         s.status = "AirBlender waiting: " + reason
         return False
+    s.controller_device = path
     ensure_scene_camera_for_autoarm(scene, context)
     bpy.ops.dfr.create_rig()
     configure_drone_split_view_layout(context)
@@ -1950,28 +2298,34 @@ def _auto_arm_tick():
     RUNTIME.auto_arm_last_try = now
     try:
         if auto_arm_if_controller_present(bpy.context):
-            return 2.0
+            RUNTIME.auto_arm_failures = 0
+            return 0.75
         RUNTIME.auto_arm_failures += 1
     except Exception as ex:
         scene.drone_flight_recorder_settings.status = "AirBlender autosense error: %s" % ex
         RUNTIME.auto_arm_failures += 1
-    return 1.0 if RUNTIME.auto_arm_failures < 10 else 3.0
+    return 0.75
 
 
 def ensure_auto_arm_runtime():
     if RUNTIME.auto_arm_running:
         return True
     RUNTIME.auto_arm_running = True
-    bpy.app.timers.register(_auto_arm_tick, first_interval=1.0, persistent=True)
+    bpy.app.timers.register(_auto_arm_tick, first_interval=0.5, persistent=True)
     return True
 
 
 def _draw_controller_icon():
     try:
+        available, _reason = controller_live_available()
+        if not available:
+            return
+        if not _is_primary_viewport_draw():
+            return
         x, y, w, h = RUNTIME.icon_region
         font_id = 0
         active = bool(RUNTIME.timer_running)
-        alpha = 0.78 if active else 0.50
+        alpha = 0.82 if active else 0.58
         blf.size(font_id, 28)
         blf.color(font_id, 0.72, 0.90, 1.0, alpha)
         blf.position(font_id, x, y + 8, 0)
@@ -1980,6 +2334,49 @@ def _draw_controller_icon():
         blf.color(font_id, 0.72, 0.90, 1.0, alpha)
         blf.position(font_id, x, y - 8, 0)
         blf.draw(font_id, "AirBlender")
+        if RUNTIME.controls_overlay_visible:
+            lines = (
+                "A: hide controls",
+                "B: third-person side pane",
+                "R3: portrait/landscape",
+                "Start: cycle cameras; double-tap new camera",
+                "Select: cycle takes; double-tap new/empty take",
+                "Y: invert right stick + roll + bumpers",
+                "X: speed low/medium/high/xhigh",
+                "LB/RB: view-up/down; double-tap auto",
+                "Auto: opposite reverses, same stops",
+                "L3 + RT/LT: focal length",
+                "D-pad Up: screenshot",
+                "D-pad Down: record/stop/overwrite",
+                "D-pad L/R: rewind/forward take",
+            )
+            try:
+                import gpu
+                from gpu_extras.batch import batch_for_shader
+                bx, by = x + 2, y + 52
+                bw, bh = 360, 20 + len(lines) * 16
+                verts = ((bx - 8, by - 8), (bx + bw, by - 8), (bx + bw, by + bh), (bx - 8, by + bh))
+                shader = gpu.shader.from_builtin("UNIFORM_COLOR")
+                batch = batch_for_shader(shader, "TRI_FAN", {"pos": verts})
+                gpu.state.blend_set("ALPHA")
+                shader.bind()
+                shader.uniform_float("color", (0.01, 0.015, 0.02, 0.76))
+                batch.draw(shader)
+                border = batch_for_shader(shader, "LINE_LOOP", {"pos": verts})
+                shader.uniform_float("color", (0.72, 0.90, 1.0, 0.55))
+                border.draw(shader)
+                gpu.state.blend_set("NONE")
+            except Exception:
+                pass
+            blf.size(font_id, 12)
+            blf.color(font_id, 0.72, 0.90, 1.0, 0.95)
+            blf.position(font_id, x + 4, y + 52 + len(lines) * 16, 0)
+            blf.draw(font_id, "The Last AirBlender Controls")
+            blf.size(font_id, 11)
+            blf.color(font_id, 0.90, 0.96, 1.0, 0.92)
+            for i, line in enumerate(lines):
+                blf.position(font_id, x + 4, y + 52 + (len(lines) - 1 - i) * 16, 0)
+                blf.draw(font_id, line)
     except Exception:
         pass
 
@@ -1998,17 +2395,9 @@ class LAB_OT_icon_runtime(bpy.types.Operator):
         return {"RUNNING_MODAL"}
 
     def modal(self, context, event):
-        if event.type in {"LEFTMOUSE", "RIGHTMOUSE"} and event.value == "PRESS":
-            x, y, w, h = RUNTIME.icon_region
-            mx = getattr(event, "mouse_region_x", -9999)
-            my = getattr(event, "mouse_region_y", -9999)
-            if x - 10 <= mx <= x + w and y - 18 <= my <= y + h:
-                if event.type == "LEFTMOUSE":
-                    if not RUNTIME.timer_running:
-                        auto_arm_if_controller_present(context) or bpy.ops.lab.activate()
-                else:
-                    bpy.ops.wm.call_menu(name="LAB_MT_controller_controls")
-                return {"RUNNING_MODAL"}
+        # Bottom-corner AirBlender mark is status-only. Do not intercept mouse
+        # events here; native header menu owns controls because Blender handles
+        # that click behavior reliably.
         if event.type == "ESC" and event.value == "PRESS":
             return {"PASS_THROUGH"}
         return {"PASS_THROUGH"}
@@ -2043,22 +2432,26 @@ class DFR_PT_panel(bpy.types.Panel):
         col.label(text="Controller: %s" % ("connected" if s.controller_connected else "disconnected"))
         col.label(text="Recording: %s" % ("ON" if s.recording else "off"))
         col.label(text="Take: %d / %d" % (s.active_take_slot, TAKE_SLOT_COUNT))
-        col.label(text="A = first/third-person view")
-        col.label(text="Y = global invert")
+        col.label(text="A = show/hide controls")
+        col.label(text="B = toggle third-person side pane")
+        col.label(text="R3 = portrait / landscape")
+        col.label(text="Y = invert right stick + roll + bumpers")
         col.label(text="Invert: " + joystick_invert_mode_label(s.joystick_invert_mode))
         col.label(text="D-pad Up = camera screenshot")
         col.label(text="D-pad Down = record / overwrite")
         col.label(text="Start = cycle cameras; double-tap creates camera")
-        col.label(text="Select = cycle takes 1-10")
+        col.label(text="Select = cycle takes; double-tap new/empty take")
         col.label(text="D-pad Left/Right = rewind/forward active take")
         if s.last_screenshot_path:
             col.label(text="Last shot: " + os.path.basename(s.last_screenshot_path))
-        col.label(text="RB/LB = rise/fall; double-tap auto; tap reverses")
+        col.label(text="RB/LB = rise/fall; double-tap auto")
+        col.label(text="Auto: opposite reverses, same stops")
         col.label(text="Right stick = viewport-locked look")
         col.label(text="Left stick = strafe + forward/back")
         col.label(text="RT/LT = analog camera barrel roll")
+        col.label(text="L3 + RT/LT = focal length")
         col.label(text="X = low / medium / high / xhigh")
-        col.label(text="Click 🎮 icon to arm; right-click for controls")
+        col.label(text="A shows/hides AirBlender controls")
         col.operator("dfr.probe_controller", icon="VIEWZOOM")
         col.prop(s, "controller_device")
         layout.separator()
@@ -2074,7 +2467,7 @@ class DFR_PT_panel(bpy.types.Panel):
         layout.separator()
         box = layout.box()
         box.label(text="Flight Settings")
-        for prop in ("max_speed", "vertical_speed", "global_sensitivity_level", "left_stick_gain", "yaw_speed", "gimbal_speed", "roll_speed", "roll_auto_level", "roll_return_speed", "bumper_double_tap_window", "manual_bumper_thrust_multiplier", "record_scrub_frames_per_tick", "start_double_tap_window", "joystick_invert_mode", "unlimited_pitch", "acceleration", "drag", "deadzone", "smoothing", "banking", "keyframe_interval", "keyframe_threshold"):
+        for prop in ("max_speed", "vertical_speed", "global_sensitivity_level", "left_stick_gain", "yaw_speed", "gimbal_speed", "roll_speed", "focal_length_speed", "roll_auto_level", "roll_return_speed", "bumper_double_tap_window", "manual_bumper_thrust_multiplier", "record_scrub_frames_per_tick", "start_double_tap_window", "joystick_invert_mode", "unlimited_pitch", "acceleration", "drag", "inertia", "bank_lag", "deadzone", "smoothing", "banking", "keyframe_interval", "keyframe_threshold"):
             box.prop(s, prop)
         layout.prop(s, "show_mapping", toggle=True)
         if s.show_mapping:
@@ -2083,7 +2476,7 @@ class DFR_PT_panel(bpy.types.Panel):
             box.label(text="Defaults: Start/Menu camera fleet, Left stick move, Right stick look, RB/LB rise/fall, RT/LT roll")
             for prop in ("axis_left_x", "axis_left_y", "axis_right_x", "axis_right_y", "axis_left_trigger", "axis_right_trigger", "axis_dpad_y", "axis_dpad_x", "dpad_up_direction", "dpad_down_direction", "dpad_left_direction", "dpad_right_direction", "invert_left_x", "invert_left_y", "invert_right_x", "invert_right_y"):
                 box.prop(s, prop)
-            for prop in ("button_a", "button_b", "button_x", "button_y", "button_lb", "button_rb", "button_select", "button_start", "precision_multiplier", "boost_multiplier"):
+            for prop in ("button_a", "button_b", "button_x", "button_y", "button_lb", "button_rb", "button_select", "button_start", "button_l3", "button_r3", "precision_multiplier", "boost_multiplier"):
                 box.prop(s, prop)
 
 
@@ -2100,6 +2493,7 @@ classes = (
     LAB_OT_activate,
     LAB_OT_icon_runtime,
     LAB_MT_controller_controls,
+    LAB_PT_controls_popover,
     DFR_PT_panel,
 )
 
@@ -2108,6 +2502,10 @@ def register():
     for cls in classes:
         bpy.utils.register_class(cls)
     bpy.types.Scene.drone_flight_recorder_settings = bpy.props.PointerProperty(type=DroneFlightSettings)
+    try:
+        bpy.types.VIEW3D_HT_header.remove(draw_airblender_header)
+    except Exception:
+        pass
     ensure_icon_runtime()
 
 
@@ -2123,6 +2521,10 @@ def unregister():
         RUNTIME.icon_running = False
     if hasattr(bpy.types.Scene, "drone_flight_recorder_settings"):
         del bpy.types.Scene.drone_flight_recorder_settings
+    try:
+        bpy.types.VIEW3D_HT_header.remove(draw_airblender_header)
+    except Exception:
+        pass
     for cls in reversed(classes):
         try:
             bpy.utils.unregister_class(cls)

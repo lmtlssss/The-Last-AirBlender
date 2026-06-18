@@ -25,7 +25,7 @@ sh install.sh
 Pin a version:
 
 ```bash
-LAST_AIRBLENDER_VERSION=v1.0.2 sh install.sh
+LAST_AIRBLENDER_VERSION=v1.0.3 sh install.sh
 ```
 
 ### Windows PowerShell
@@ -58,7 +58,7 @@ Download the latest native installer from GitHub Releases:
 
 After install, open Blender normally. A small translucent controller icon labeled **AirBlender** appears in the 3D viewport. If an Xbox-compatible controller is visible to Blender, AirBlender autosenses it and arms camera flight automatically.
 
-- **Autosense**: plugging in an Xbox-compatible controller automatically activates The Last AirBlender, creates/attaches the camera rig, and switches to the split camera/third-person layout.
+- **Autosense**: plugging in an Xbox-compatible controller, even mid-session, automatically activates The Last AirBlender, creates/attaches the camera rig, and switches to the split camera/third-person layout.
 - **Left-click the controller icon**: fallback manual activate if autosense has not armed yet.
 - **Right-click the controller icon**: show the native controls menu.
 - No terminal or background CLI is required for normal Blender use on systems where Blender can read the controller directly.
@@ -136,7 +136,7 @@ Common issues:
 - **Blender not found**: set `BLENDER=/path/to/blender`.
 - **Controller not detected**: plug in an Xbox-compatible controller and rerun `doctor`.
 - **Linux permissions**: install package normally and ensure your user can access game controllers.
-- **Windows SmartScreen/macOS Gatekeeper**: v1.0.2 packages may be unsigned; use the inspect-first install path if preferred.
+- **Windows SmartScreen/macOS Gatekeeper**: v1.0.3 packages may be unsigned; use the inspect-first install path if preferred.
 
 ## Developer build
 
