@@ -1,0 +1,59 @@
+name: release
+on:
+  push:
+    tags: ['v*']
+permissions:
+  contents: write
+jobs:
+  linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: sudo apt-get update && sudo apt-get install -y libudev-dev pkg-config rpm zip
+      - run: cargo build --release
+      - run: scripts/package-deb.sh
+      - run: scripts/package-rpm.sh
+      - run: scripts/package-addon.sh
+      - run: tar -C target/release -czf dist/last-airblender_x86_64.tar.gz last-airblender
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux-assets
+          path: dist/*
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: powershell -ExecutionPolicy Bypass -File scripts/package-windows-msi.ps1
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-assets
+          path: dist/*
+  macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo build --release
+      - run: scripts/package-macos-pkg.sh
+      - run: tar -C target/release -czf dist/last-airblender_$(uname -m).tar.gz last-airblender
+      - uses: actions/upload-artifact@v4
+        with:
+          name: macos-assets
+          path: dist/*
+  publish:
+    runs-on: ubuntu-latest
+    needs: [linux, windows, macos]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist-in
+      - run: |
+          mkdir -p dist
+          find dist-in -maxdepth 3 -type f -exec cp {} dist/ \;
+          scripts/checksums.sh
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*

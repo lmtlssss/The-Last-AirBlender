@@ -1,0 +1,15 @@
+/target/
+/dist/
+*.log
+*.tmp
+*.pyc
+__pycache__/
+.DS_Store
+*.blend
+*.blend1
+*.png
+screenshots/
+tmp/
+.env
+*.key
+*.pem

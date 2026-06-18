@@ -1,0 +1,24 @@
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs">
+  <Package Name="The Last AirBlender" Manufacturer="lmtlssss" Version="0.1.0" UpgradeCode="7df5687a-14a1-4de6-877a-5d00a3b916e8">
+    <MajorUpgrade DowngradeErrorMessage="A newer version is already installed." />
+    <MediaTemplate EmbedCab="yes" />
+    <Feature Id="Main" Title="The Last AirBlender" Level="1">
+      <ComponentGroupRef Id="AppFiles" />
+    </Feature>
+  </Package>
+  <Fragment>
+    <StandardDirectory Id="ProgramFilesFolder">
+      <Directory Id="INSTALLFOLDER" Name="The Last AirBlender" />
+    </StandardDirectory>
+  </Fragment>
+  <Fragment>
+    <ComponentGroup Id="AppFiles" Directory="INSTALLFOLDER">
+      <Component Id="Exe" Guid="b4c6fc9f-21d1-4f6e-8b88-c908300f16dd">
+        <File Source="target\release\last-airblender.exe" KeyPath="yes" />
+      </Component>
+      <Component Id="Addon" Guid="af23a8dd-0fd3-4d6e-8fa1-0792a8b2216f">
+        <File Source="addon\last_airblender.py" KeyPath="yes" />
+      </Component>
+    </ComponentGroup>
+  </Fragment>
+</Wix>
