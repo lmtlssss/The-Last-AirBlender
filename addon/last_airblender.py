@@ -596,9 +596,10 @@ def left_stick_movement_multiplier(settings_obj):
 
 
 def effective_toggle_invert(base_invert, mode, axis_name):
-    # OFF preserves calibrated/stock feel. ON flips the right stick only.
-    # Left stick stays natural: X=strafe, Y=forward/back and never toggles.
-    flip = bool(int(mode) % 2) and axis_name in {"right_x", "right_y"}
+    # OFF is true stock/no-invert. ON is one global inverted-pilot toggle.
+    # It flips both sticks; trigger/roll direction is flipped separately where
+    # roll_input is computed.
+    flip = bool(int(mode) % 2) and axis_name in {"left_x", "left_y", "right_x", "right_y"}
     return bool(base_invert) ^ flip
 
 

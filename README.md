@@ -25,7 +25,7 @@ sh install.sh
 Pin a version:
 
 ```bash
-LAST_AIRBLENDER_VERSION=v0.1.1 sh install.sh
+LAST_AIRBLENDER_VERSION=v0.1.2 sh install.sh
 ```
 
 ### Windows PowerShell
@@ -73,7 +73,7 @@ Then pick up the controller.
 | RB / LB tap while auto | Reverse auto direction |
 | RT / LT | Camera roll |
 | X | Low / medium / high / xhigh speed |
-| Y | Right-stick + roll invert toggle |
+| Y | Global invert toggle: both sticks + roll direction |
 | A | First/third-person view toggle |
 | D-pad Up | Camera screenshot |
 | D-pad Down | Record / stop / overwrite from scrubbed frame |
