@@ -1,26 +1,18 @@
 # the last airblender
 
-made with codex.
+blender camera flight with an xbox controller.
 
-blender camera flight from an xbox controller.
-record the pass. scrub the take. overwrite the bad tail. save the frame.
-no cloud. no account. no weird launcher ritual.
+record camera moves as animation takes.
+scrub a take, overwrite from the playhead, and save camera screenshots beside the blend file.
 
 ```text
-        ┌───────────────────────────────┐
-        │  the last airblender          │
-        ├───────────────────────────────┤
-        │  xbox controller              │
-        │        │                      │
-        │        ▼                      │
-        │  blender viewport             │
-        │        │                      │
-        │        ▼                      │
-        │  airblender camera rig        │
-        │        │                      │
-        │        ├── keyframed takes    │
-        │        └── png screenshots    │
-        └───────────────────────────────┘
+THE LAST AIRBLENDER
+──────────────────────────────────────────────────────────────
+
+xbox controller  ──►  blender viewport  ──►  camera rig
+                                            │
+                                            ├─ animation takes
+                                            └─ screenshots
 ```
 
 ## install
@@ -31,7 +23,7 @@ no cloud. no account. no weird launcher ritual.
 curl -fsSL https://raw.githubusercontent.com/lmtlssss/The-Last-AirBlender/main/install.sh | sh
 ```
 
-inspect first if you want to see the wires:
+inspect first:
 
 ```bash
 curl -fsSLO https://raw.githubusercontent.com/lmtlssss/The-Last-AirBlender/main/install.sh
@@ -59,11 +51,11 @@ notepad install.ps1
 powershell -ExecutionPolicy Bypass -File .\install.ps1
 ```
 
-### manual parts bin
-
-pull the latest installer from github releases:
+### release files
 
 ```text
+file                         system
+──────────────────────────────────────────────────────────────
 .deb                         ubuntu / debian
 .rpm                         fedora / rhel
 .msi                         windows
@@ -71,81 +63,76 @@ pull the latest installer from github releases:
 last-airblender-addon.zip    manual blender add-on
 ```
 
-## runtime plate
+## start
 
-open blender like normal.
+open blender normally.
 plug in an xbox controller.
-look for the small translucent **airblender** controller icon in the 3d viewport.
+
+when blender sees the controller, airblender arms the camera rig and shows a small controller icon in the 3d viewport.
 
 ```text
-┌─ blender viewport ─────────────────────────────────────────┐
-│                                                           │
-│   [ airblender ]  left click  : arm / activate fallback    │
-│                  right click : native controls menu        │
-│                                                           │
-│   autosense finds the controller and arms the camera rig.  │
-└───────────────────────────────────────────────────────────┘
+viewport icon
+──────────────────────────────────────────────────────────────
+left click      activate / re-arm
+right click     controls menu
 ```
 
-normal use does not need a terminal.
-the cli is for checks, packaging, and bridge fallback work:
+cli checks:
 
 ```bash
 last-airblender doctor
 last-airblender launch your-scene.blend
 ```
 
-## controller map
+## controls
 
 ```text
-┌────────────────────┬──────────────────────────────────────────────┐
-│ control            │ action                                       │
-├────────────────────┼──────────────────────────────────────────────┤
-│ start / menu       │ cycle airblender + scene cameras             │
-│ start double tap   │ create AirBlender_Cam_### at current view     │
-│ start triple tap   │ delete current camera, arm the next usable    │
-│ left stick x       │ strafe left / right                          │
-│ left stick y       │ move forward / back along camera view         │
-│ right stick        │ viewport-locked look                         │
-│ rb / lb            │ rise / fall at 75% left-stick speed           │
-│ rb / lb double tap │ auto rise / fall                             │
-│ rb / lb while auto │ reverse auto direction                       │
-│ rt / lt            │ camera roll                                  │
-│ l3 + rt / lt       │ focal length                                 │
-│ x                  │ speed: low / medium / high / xhigh           │
-│ y                  │ invert look, roll, and rise/fall             │
-│ a                  │ show / hide controls overlay                 │
-│ b                  │ toggle third-person side pane                │
-│ r3                 │ portrait / landscape camera frame            │
-│ d-pad up           │ screenshot                                   │
-│ d-pad down         │ record / stop / overwrite from scrub frame    │
-│ d-pad left/right   │ scrub active take backward / forward          │
-│ select / back      │ cycle take slots 1-10                        │
-│ select double tap  │ jump to new / empty take slot                 │
-└────────────────────┴──────────────────────────────────────────────┘
+control                  action
+──────────────────────────────────────────────────────────────
+start / menu             cycle cameras
+start double tap         create AirBlender_Cam_### at current view
+start triple tap         delete current camera
+
+left stick x             strafe left / right
+left stick y             move forward / back
+right stick              look
+rb / lb                  rise / fall
+rb / lb double tap       auto rise / fall
+rb / lb while auto       reverse auto direction
+rt / lt                  roll
+l3 + rt / lt             focal length
+
+x                        speed: low / medium / high / xhigh
+y                        invert look, roll, and rise/fall
+a                        show / hide controls overlay
+b                        toggle third-person side pane
+r3                       portrait / landscape camera frame
+
+d-pad up                 screenshot
+d-pad down               record / stop / overwrite
+d-pad left / right       scrub active take
+select / back            cycle take slots 1-10
+select double tap        jump to a new / empty take slot
 ```
 
-no remapping required.
-
-## take deck
+## take workflow
 
 ```text
-01  plug in controller
-02  open blender
-03  airblender autosenses and arms
-04  start double tap        -> make camera
-05  fly the shot
-06  d-pad down              -> record
+01  open blender
+02  plug in controller
+03  airblender arms
+04  start double tap       create camera
+05  fly
+06  d-pad down             record
 07  fly the take
-08  d-pad down              -> stop
-09  d-pad left / right      -> scrub
-10  d-pad down after scrub  -> trim future + overwrite
+08  d-pad down             stop
+09  d-pad left / right     scrub
+10  d-pad down             overwrite from playhead
 ```
 
 ## screenshots
 
 press d-pad up.
-a camera-perspective png lands beside the saved `.blend`:
 
 ```text
 <your-blend-folder>/last_airblender_screenshots/
@@ -153,7 +140,7 @@ a camera-perspective png lands beside the saved `.blend`:
 
 ## scene names
 
-new v1.0 helpers use airblender names:
+new helpers:
 
 ```text
 AirBlender_Camera_Fleet
@@ -164,7 +151,7 @@ AirBlender_Cam_###
 LAB_* actions and markers
 ```
 
-old drone-flight scenes still load:
+older scene names are still supported:
 
 ```text
 Drone_Rig
@@ -179,23 +166,21 @@ DFR_* actions and markers
 last-airblender doctor
 ```
 
-usual checks:
-
 ```text
-blender not found       set BLENDER=/path/to/blender
-controller not found    plug in the xbox controller and rerun doctor
-linux permissions       install normally; make sure game controllers are readable
-unsigned packages       v1.0.4 may trigger smartscreen / gatekeeper
+blender not found        set BLENDER=/path/to/blender
+controller not found     plug in the xbox controller and rerun doctor
+linux permissions        make sure game controllers are readable
+unsigned packages        v1.0.4 packages may be unsigned
 ```
 
-## dev bench
+## build
 
 ```bash
 cargo build --release
 scripts/package-deb.sh
 ```
 
-blender smoke test, on a machine with blender installed:
+blender smoke test:
 
 ```bash
 /snap/bin/blender --background --python tests/blender/smoke_dpad_scrub_after_stop.py
